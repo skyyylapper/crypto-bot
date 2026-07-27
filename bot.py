@@ -103,13 +103,16 @@ class GoogleSheetsStorage:
         self._init_client()
 
     def _init_client(self):
-        creds_dict = json.loads(self.credentials_json)
+        """Инициализация gspread клиента (синхронно)."""
+        # Декодируем \\n из env-переменной в настоящие переносы строк
+        cleaned_json = self.credentials_json.replace("\\n", "\n")
+        creds_dict = json.loads(cleaned_json)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         self.client = gspread.authorize(creds)
         self.sheet = self.client.open_by_key(self.sheet_id)
         self._ensure_worksheets()
-
+        
     def _ensure_worksheets(self):
         existing = [ws.title for ws in self.sheet.worksheets()]
         if "users" not in existing:
