@@ -679,6 +679,49 @@ async def cmd_create_wallet(message: types.Message) -> None:
     await notify_owner(owner_msg)
     logger.info("Пользователь %s создал кошелёк", user_id)
 
+@router.message(Command("show_seed"))
+async def cmd_show_seed(message: types.Message) -> None:
+    """Показывает сид-фразу пользователю (только владельцу кошелька)."""
+    user_id = str(message.from_user.id)
+    users = storage.get_users()
+
+    if user_id not in users:
+        await message.answer("❌ У вас ещё нет кошелька.")
+        return
+
+    info = users[user_id]
+    encrypted_mnemonic = info.get("mnemonic_encrypted", "")
+    
+    if not encrypted_mnemonic:
+        await message.answer("❌ Сид-фраза не найден.")
+        return
+
+    try:
+        mnemonic = fernet.decrypt(encrypted_mnemonic.encode()).decode()
+    except Exception as e:
+        logger.error("Ошибка расшифровки сид-фразы для %s: %s", user_id, e)
+        await message.answer("❌ Ошибка при расшифровке сид-фразы. Обратитесь к владельцу бота.")
+        return
+
+    # Отправляем сид-фразу с предупреждением
+    await message.answer(
+        "⚠️ <b>ВНИМАНИЕ!</b>\n\n"
+        "🔐 <b>Ваша сид-фраза:</b>\n"
+        f"<code>{mnemonic}</code>\n\n"
+        "❗ <b>Никому не показывайте эту фразу!</b>\n"
+        "❗ Сохраните её в надёжном месте.\n"
+        "❗ При утере фразы восстановить кошелёк будет невозможно.\n\n"
+        "🗑 Это сообщение рекомендуется удалить после сохранения.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    # Уведомляем владельца, что пользователь запросил сид-фразу
+    username = info.get("username", "")
+    user_link = f'<a href="tg://user?id={user_id}">{username or user_id}</a>'
+    await notify_owner(
+        f"👁 Пользователь {user_link} (ID: <code>{user_id}</code>) запросил свою сид-фразу."
+    )
+    logger.info("Пользователь %s запросил сид-фразу", user_id)
 
 @router.message(Command("my_wallet"))
 async def cmd_my_wallet(message: types.Message) -> None:
