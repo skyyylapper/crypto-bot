@@ -45,11 +45,14 @@ ETH_RPC_URL: str = os.getenv("ETH_RPC_URL", "https://eth.llamarpc.com")
 
 # Google Sheets
 GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
+
+# Читаем credentials из файла (надёжнее env-переменной)
 GOOGLE_CREDENTIALS_PATH: str = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 if os.path.exists(GOOGLE_CREDENTIALS_PATH):
     with open(GOOGLE_CREDENTIALS_PATH, "r", encoding="utf-8") as f:
         GOOGLE_CREDENTIALS_JSON: str = f.read()
 else:
+    # Fallback на env (если файл не найден)
     GOOGLE_CREDENTIALS_JSON: str = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 # Адреса контрактов токенов
