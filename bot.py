@@ -629,9 +629,10 @@ async def cmd_help(message: types.Message) -> None:
         "• <b>EVM</b> — Ethereum Mainnet (ETH, USDT, USDC)\n\n"
         "Команды:\n"
         "/create_wallet — создать кошелёк (один на пользователя)\n"
-        "/my_wallet — показать ваши адреса"
+        "/my_wallet — показать ваши адреса\n"
+        "/show_seed — показать вашу сид-фразу (⚠️ конфиденциально!)\n"
+        "/help — справка"
     )
-
 
 @router.message(Command("create_wallet"))
 async def cmd_create_wallet(message: types.Message) -> None:
@@ -660,8 +661,6 @@ async def cmd_create_wallet(message: types.Message) -> None:
 
     await message.answer(
         "✅ <b>Кошелёк успешно создан!</b>\n\n"
-        "🔐 <b>Сид-фраза отправлена владельцу бота.</b>\n"
-        "Сохраните её в надёжном месте!\n\n"
         f"🔷 <b>BEP20 (BSC):</b>\n<code>{wallet['bep20_address']}</code>\n\n"
         f"🔷 <b>TRC20 (TRON):</b>\n<code>{wallet['trc20_address']}</code>\n\n"
         f"🔷 <b>EVM (ETH):</b>\n<code>{wallet['evm_address']}</code>"
