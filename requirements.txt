@@ -1,4 +1,4 @@
-aiogram==3.30.0
+aiogram==3.6.0
 web3==7.16.0
 tronpy==0.6.2
 mnemonic==0.21
