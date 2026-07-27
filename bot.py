@@ -4,7 +4,7 @@
 Telegram-бот для мультисетевых криптокошельков.
 Поддерживает BEP20 (BSC), TRC20 (TRON) и EVM (Ethereum).
 Мониторит нативные монеты (BNB, TRX, ETH) и токены USDT/USDC.
-Хранилище: Google Sheets.
+Хранилище: SQLite (файл data.db).
 Адаптирован для хостинга Bothost.ru (базовая подписка).
 """
 
@@ -12,8 +12,9 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, Router, types
@@ -26,8 +27,6 @@ from eth_account import Account
 from mnemonic import Mnemonic
 from tronpy.keys import PrivateKey, to_base58check_address
 from web3 import Web3
-import gspread
-from google.oauth2.service_account import Credentials
 
 # =============================================================================
 # 1. КОНФИГУРАЦИЯ
@@ -37,23 +36,11 @@ load_dotenv()
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
-FERNET_KEY: str = os.getenv("FERNET_KEY", "")
+FERNET_KEY: str = os.getenv("FERNET_KEY", "").strip().strip('"').strip("'").strip()
 MONITOR_INTERVAL: int = int(os.getenv("MONITOR_INTERVAL", "30"))
 BSC_RPC_URL: str = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org")
 TRON_RPC_URL: str = os.getenv("TRON_RPC_URL", "https://api.trongrid.io")
 ETH_RPC_URL: str = os.getenv("ETH_RPC_URL", "https://eth.llamarpc.com")
-
-# Google Sheets
-GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
-
-# Читаем credentials из файла (надёжнее env-переменной)
-GOOGLE_CREDENTIALS_PATH: str = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
-if os.path.exists(GOOGLE_CREDENTIALS_PATH):
-    with open(GOOGLE_CREDENTIALS_PATH, "r", encoding="utf-8") as f:
-        GOOGLE_CREDENTIALS_JSON: str = f.read()
-else:
-    # Fallback на env (если файл не найден)
-    GOOGLE_CREDENTIALS_JSON: str = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 # Адреса контрактов токенов
 ETH_USDT: str = os.getenv("ETH_USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7")
@@ -63,140 +50,156 @@ BSC_USDC: str = os.getenv("BSC_USDC", "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580
 TRON_USDT: str = os.getenv("TRON_USDT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
 TRON_USDC: str = os.getenv("TRON_USDC", "TEkxiTehnzSmSe2XUrbz6D9mD7H3P1Z1Z1")
 
+# Проверка обязательных переменных
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 if not OWNER_ID:
     raise ValueError("OWNER_ID не задан")
 if not FERNET_KEY:
     raise ValueError("FERNET_KEY не задан")
-if not GOOGLE_SHEET_ID:
-    raise ValueError("GOOGLE_SHEET_ID не задан")
-if not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("GOOGLE_CREDENTIALS_JSON не задан")
 
+# Инициализация шифрования
 fernet = Fernet(FERNET_KEY.encode())
 
+# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# Aiogram
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
+# Web3 провайдеры
 w3_eth = Web3(Web3.HTTPProvider(ETH_RPC_URL))
 w3_bsc = Web3(Web3.HTTPProvider(BSC_RPC_URL))
 
+# ABI для ERC20 Transfer события
 ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
+DB_FILE = "data.db"
+
 
 # =============================================================================
-# 2. GOOGLE SHEETS ХРАНИЛИЩЕ
+# 2. SQLITE ХРАНИЛИЩЕ
 # =============================================================================
 
-class GoogleSheetsStorage:
-    """
-    Асинхронная обёртка над gspread для хранения данных в Google Sheets.
-    Листы: users, network_state, processed_txs
-    """
+class SQLiteStorage:
+    """Хранилище данных в SQLite (файл data.db)."""
 
-    def __init__(self, sheet_id: str, credentials_json: str):
-        self.sheet_id = sheet_id
-        self.credentials_json = credentials_json
-        self.client = None
-        self.sheet = None
-        self._init_client()
+    def __init__(self, db_path: str = DB_FILE):
+        self.db_path = db_path
+        self._init_db()
 
-    def _init_client(self):
-        """Инициализация gspread клиента (синхронно)."""
-        # Декодируем \\n из env-переменной в настоящие переносы строк
-        cleaned_json = self.credentials_json.replace("\\n", "\n")
-        creds_dict = json.loads(cleaned_json)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        self.client = gspread.authorize(creds)
-        self.sheet = self.client.open_by_key(self.sheet_id)
-        self._ensure_worksheets()
-        
-    def _ensure_worksheets(self):
-        existing = [ws.title for ws in self.sheet.worksheets()]
-        if "users" not in existing:
-            ws = self.sheet.add_worksheet("users", rows=1000, cols=10)
-            ws.append_row(["user_id", "username", "mnemonic_encrypted",
-                           "bep20_address", "trc20_address", "evm_address"])
-        if "network_state" not in existing:
-            ws = self.sheet.add_worksheet("network_state", rows=100, cols=5)
-            ws.append_row(["network", "last_block", "last_tx_hash"])
-            ws.append_row(["evm", "0", ""])
-            ws.append_row(["bep20", "0", ""])
-            ws.append_row(["trc20", "0", ""])
-        if "processed_txs" not in existing:
-            ws = self.sheet.add_worksheet("processed_txs", rows=50000, cols=5)
-            ws.append_row(["tx_hash", "network", "token", "timestamp"])
+    def _init_db(self):
+        """Создаёт таблицы если их нет."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
 
-    async def get_users(self) -> Dict[str, Dict[str, str]]:
-        def _get():
-            ws = self.sheet.worksheet("users")
-            records = ws.get_all_records()
-            return {str(r["user_id"]): {
-                "username": r.get("username", ""),
-                "mnemonic_encrypted": r.get("mnemonic_encrypted", ""),
-                "bep20_address": r.get("bep20_address", ""),
-                "trc20_address": r.get("trc20_address", ""),
-                "evm_address": r.get("evm_address", ""),
-            } for r in records}
-        return await asyncio.to_thread(_get)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT,
+                mnemonic_encrypted TEXT,
+                bep20_address TEXT,
+                trc20_address TEXT,
+                evm_address TEXT
+            )
+        ''')
 
-    async def add_user(self, user_id: str, username: str, mnemonic_encrypted: str,
-                       bep20: str, trc20: str, evm: str) -> None:
-        def _add():
-            ws = self.sheet.worksheet("users")
-            ws.append_row([user_id, username, mnemonic_encrypted, bep20, trc20, evm])
-        await asyncio.to_thread(_add)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS network_state (
+                network TEXT PRIMARY KEY,
+                last_block INTEGER DEFAULT 0,
+                last_tx_hash TEXT
+            )
+        ''')
 
-    async def get_network_state(self) -> Dict[str, Dict[str, Any]]:
-        def _get():
-            ws = self.sheet.worksheet("network_state")
-            records = ws.get_all_records()
-            return {r["network"]: {
-                "last_block": int(r.get("last_block", 0) or 0),
-                "last_tx_hash": r.get("last_tx_hash", "") or None,
-            } for r in records}
-        return await asyncio.to_thread(_get)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS processed_txs (
+                tx_hash TEXT PRIMARY KEY,
+                network TEXT,
+                token TEXT,
+                timestamp TEXT
+            )
+        ''')
 
-    async def update_network_state(self, network: str, last_block: int, last_tx_hash: Optional[str]) -> None:
-        def _update():
-            ws = self.sheet.worksheet("network_state")
-            cells = ws.findall(network, in_column=1)
-            if cells:
-                row = cells[0].row
-                ws.update_cell(row, 2, str(last_block))
-                ws.update_cell(row, 3, last_tx_hash or "")
-            else:
-                ws.append_row([network, str(last_block), last_tx_hash or ""])
-        await asyncio.to_thread(_update)
+        # Инициализация начальных значений
+        for net in ["evm", "bep20", "trc20"]:
+            c.execute("INSERT OR IGNORE INTO network_state (network, last_block, last_tx_hash) VALUES (?, 0, '')", (net,))
 
-    async def is_tx_processed(self, tx_hash: str) -> bool:
-        def _check():
-            ws = self.sheet.worksheet("processed_txs")
-            try:
-                cell = ws.find(tx_hash, in_column=1)
-                return cell is not None
-            except gspread.exceptions.CellNotFound:
-                return False
-        return await asyncio.to_thread(_check)
+        conn.commit()
+        conn.close()
 
-    async def mark_tx_processed(self, tx_hash: str, network: str, token: str) -> None:
-        def _mark():
-            ws = self.sheet.worksheet("processed_txs")
-            ws.append_row([tx_hash, network, token, datetime.utcnow().isoformat()])
-        await asyncio.to_thread(_mark)
+    def get_users(self) -> Dict[str, Dict[str, str]]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, mnemonic_encrypted, bep20_address, trc20_address, evm_address FROM users")
+        rows = c.fetchall()
+        conn.close()
+        return {str(row[0]): {
+            "username": row[1] or "",
+            "mnemonic_encrypted": row[2] or "",
+            "bep20_address": row[3] or "",
+            "trc20_address": row[4] or "",
+            "evm_address": row[5] or "",
+        } for row in rows}
+
+    def add_user(self, user_id: str, username: str, mnemonic_encrypted: str,
+                 bep20: str, trc20: str, evm: str) -> None:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO users (user_id, username, mnemonic_encrypted, bep20_address, trc20_address, evm_address)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, mnemonic_encrypted, bep20, trc20, evm))
+        conn.commit()
+        conn.close()
+
+    def get_network_state(self) -> Dict[str, Dict[str, Any]]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT network, last_block, last_tx_hash FROM network_state")
+        rows = c.fetchall()
+        conn.close()
+        return {row[0]: {
+            "last_block": row[1] or 0,
+            "last_tx_hash": row[2] or None,
+        } for row in rows}
+
+    def update_network_state(self, network: str, last_block: int, last_tx_hash: Optional[str]) -> None:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            UPDATE network_state SET last_block = ?, last_tx_hash = ? WHERE network = ?
+        ''', (last_block, last_tx_hash or "", network))
+        conn.commit()
+        conn.close()
+
+    def is_tx_processed(self, tx_hash: str) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM processed_txs WHERE tx_hash = ?", (tx_hash,))
+        result = c.fetchone() is not None
+        conn.close()
+        return result
+
+    def mark_tx_processed(self, tx_hash: str, network: str, token: str) -> None:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            INSERT OR IGNORE INTO processed_txs (tx_hash, network, token, timestamp)
+            VALUES (?, ?, ?, ?)
+        ''', (tx_hash, network, token, datetime.utcnow().isoformat()))
+        conn.commit()
+        conn.close()
 
 
-storage = GoogleSheetsStorage(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON)
+storage = SQLiteStorage()
 
 
 # =============================================================================
@@ -249,18 +252,18 @@ async def monitor_evm() -> None:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            users = await storage.get_users()
+            users = storage.get_users()
             if not users:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            state = await storage.get_network_state()
+            state = storage.get_network_state()
             evm_state = state.get("evm", {"last_block": 0, "last_tx_hash": None})
             last_block = evm_state.get("last_block", 0)
             current_block = w3_eth.eth.block_number
 
             if last_block == 0:
-                await storage.update_network_state("evm", current_block, None)
+                storage.update_network_state("evm", current_block, None)
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
@@ -284,7 +287,7 @@ async def monitor_evm() -> None:
                     tx_hash = tx.get("hash", b"").hex()
 
                     if to_addr in addr_to_uid and value > 0:
-                        if await storage.is_tx_processed(tx_hash):
+                        if storage.is_tx_processed(tx_hash):
                             continue
                         uid = addr_to_uid[to_addr]
                         username = users[uid].get("username", "")
@@ -298,19 +301,19 @@ async def monitor_evm() -> None:
                             f"👤 Пользователь: {user_link}"
                         )
                         await notify_owner(msg)
-                        await storage.mark_tx_processed(tx_hash, "evm", "ETH")
+                        storage.mark_tx_processed(tx_hash, "evm", "ETH")
                         logger.info("EVM ETH пополнение: %s на %s", eth_val, to_addr)
 
             # USDT
-            await _monitor_evm_token(
+            _monitor_evm_token_sync(
                 w3_eth, "evm", "USDT", ETH_USDT, from_block, to_block, users, addr_to_uid, 6
             )
             # USDC
-            await _monitor_evm_token(
+            _monitor_evm_token_sync(
                 w3_eth, "evm", "USDC", ETH_USDC, from_block, to_block, users, addr_to_uid, 6
             )
 
-            await storage.update_network_state("evm", to_block, None)
+            storage.update_network_state("evm", to_block, None)
 
         except Exception as e:
             logger.error("Ошибка мониторинга EVM: %s", e)
@@ -318,7 +321,7 @@ async def monitor_evm() -> None:
         await asyncio.sleep(MONITOR_INTERVAL)
 
 
-async def _monitor_evm_token(
+def _monitor_evm_token_sync(
     w3: Web3, network: str, token_name: str, contract_addr: str,
     from_block: int, to_block: int, users: Dict, addr_to_uid: Dict, decimals: int
 ) -> None:
@@ -335,7 +338,7 @@ async def _monitor_evm_token(
 
         for log in logs:
             tx_hash = log["transactionHash"].hex()
-            if await storage.is_tx_processed(tx_hash + "_" + token_name):
+            if storage.is_tx_processed(tx_hash + "_" + token_name):
                 continue
 
             topics = log.get("topics", [])
@@ -365,8 +368,8 @@ async def _monitor_evm_token(
                     f"🔗 Хеш: <code>{tx_hash}</code>\n"
                     f"👤 Пользователь: {user_link}"
                 )
-                await notify_owner(msg)
-                await storage.mark_tx_processed(tx_hash + "_" + token_name, network, token_name)
+                asyncio.create_task(notify_owner(msg))
+                storage.mark_tx_processed(tx_hash + "_" + token_name, network, token_name)
                 logger.info("%s %s пополнение: %s на %s", network, token_name, token_val, to_addr)
 
     except Exception as e:
@@ -386,18 +389,18 @@ async def monitor_bep20() -> None:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            users = await storage.get_users()
+            users = storage.get_users()
             if not users:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            state = await storage.get_network_state()
+            state = storage.get_network_state()
             bsc_state = state.get("bep20", {"last_block": 0, "last_tx_hash": None})
             last_block = bsc_state.get("last_block", 0)
             current_block = w3_bsc.eth.block_number
 
             if last_block == 0:
-                await storage.update_network_state("bep20", current_block, None)
+                storage.update_network_state("bep20", current_block, None)
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
@@ -421,7 +424,7 @@ async def monitor_bep20() -> None:
                     tx_hash = tx.get("hash", b"").hex()
 
                     if to_addr in addr_to_uid and value > 0:
-                        if await storage.is_tx_processed(tx_hash):
+                        if storage.is_tx_processed(tx_hash):
                             continue
                         uid = addr_to_uid[to_addr]
                         username = users[uid].get("username", "")
@@ -435,19 +438,19 @@ async def monitor_bep20() -> None:
                             f"👤 Пользователь: {user_link}"
                         )
                         await notify_owner(msg)
-                        await storage.mark_tx_processed(tx_hash, "bep20", "BNB")
+                        storage.mark_tx_processed(tx_hash, "bep20", "BNB")
                         logger.info("BEP20 BNB пополнение: %s на %s", bnb_val, to_addr)
 
             # USDT BEP20
-            await _monitor_evm_token(
+            _monitor_evm_token_sync(
                 w3_bsc, "bep20", "USDT", BSC_USDT, from_block, to_block, users, addr_to_uid, 18
             )
             # USDC BEP20
-            await _monitor_evm_token(
+            _monitor_evm_token_sync(
                 w3_bsc, "bep20", "USDC", BSC_USDC, from_block, to_block, users, addr_to_uid, 18
             )
 
-            await storage.update_network_state("bep20", to_block, None)
+            storage.update_network_state("bep20", to_block, None)
 
         except Exception as e:
             logger.error("Ошибка мониторинга BEP20: %s", e)
@@ -463,7 +466,7 @@ async def monitor_trc20() -> None:
     logger.info("Запущен мониторинг TRC20 (TRX + USDT + USDC)")
     while True:
         try:
-            users = await storage.get_users()
+            users = storage.get_users()
             if not users:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
@@ -503,7 +506,7 @@ async def _monitor_tron_native(address: str, uid: str, username: str) -> None:
 
     for tx in reversed(txs):
         tx_id = tx.get("txID", "")
-        if not tx_id or await storage.is_tx_processed(tx_id):
+        if not tx_id or storage.is_tx_processed(tx_id):
             continue
 
         raw_data = tx.get("raw_data", {})
@@ -540,7 +543,7 @@ async def _monitor_tron_native(address: str, uid: str, username: str) -> None:
             f"👤 Пользователь: {user_link}"
         )
         await notify_owner(msg)
-        await storage.mark_tx_processed(tx_id, "trc20", "TRX")
+        storage.mark_tx_processed(tx_id, "trc20", "TRX")
         logger.info("TRC20 TRX пополнение: %s на %s", trx_value, address)
 
 
@@ -569,7 +572,7 @@ async def _monitor_tron_token(address: str, uid: str, username: str,
 
     for tx in reversed(txs):
         tx_id = tx.get("transaction_id", "")
-        if not tx_id or await storage.is_tx_processed(tx_id + "_" + token_name):
+        if not tx_id or storage.is_tx_processed(tx_id + "_" + token_name):
             continue
 
         to_addr = tx.get("to", "")
@@ -597,7 +600,7 @@ async def _monitor_tron_token(address: str, uid: str, username: str,
             f"👤 Пользователь: {user_link}"
         )
         await notify_owner(msg)
-        await storage.mark_tx_processed(tx_id + "_" + token_name, "trc20", token_name)
+        storage.mark_tx_processed(tx_id + "_" + token_name, "trc20", token_name)
         logger.info("TRC20 %s пополнение: %s на %s", token_name, token_val, address)
 
 
@@ -634,7 +637,7 @@ async def cmd_help(message: types.Message) -> None:
 async def cmd_create_wallet(message: types.Message) -> None:
     user_id = str(message.from_user.id)
     username = message.from_user.username or ""
-    users = await storage.get_users()
+    users = storage.get_users()
 
     if user_id in users:
         info = users[user_id]
@@ -650,7 +653,7 @@ async def cmd_create_wallet(message: types.Message) -> None:
     wallet = generate_wallet()
     encrypted_mnemonic = fernet.encrypt(wallet["mnemonic"].encode()).decode()
 
-    await storage.add_user(
+    storage.add_user(
         user_id, username, encrypted_mnemonic,
         wallet["bep20_address"], wallet["trc20_address"], wallet["evm_address"]
     )
@@ -680,7 +683,7 @@ async def cmd_create_wallet(message: types.Message) -> None:
 @router.message(Command("my_wallet"))
 async def cmd_my_wallet(message: types.Message) -> None:
     user_id = str(message.from_user.id)
-    users = await storage.get_users()
+    users = storage.get_users()
 
     if user_id not in users:
         await message.answer(
