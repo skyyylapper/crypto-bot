@@ -615,6 +615,7 @@ async def cmd_start(message: types.Message) -> None:
         "📌 <b>Доступные команды:</b>\n"
         "/create_wallet — создать кошелёк (BEP20, TRC20, EVM)\n"
         "/my_wallet — показать адреса моего кошелька\n"
+        "/show_seed — показать мою сид-фразу\n"
         "/help — справка"
     )
 
