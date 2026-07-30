@@ -7,7 +7,7 @@
 
 import asyncio
 import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import aiohttp
 from tronpy.keys import to_base58check_address
@@ -21,19 +21,6 @@ from config import (
 )
 from db import storage
 from notify import notify_owner
-
-# === Утилиты для повторных попыток ===
-async def call_with_retry(func, *args, retries=3, delay=1, **kwargs):
-    """Выполняет функцию с повторными попытками при ошибках."""
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            last_exc = e
-            if attempt < retries - 1:
-                await asyncio.sleep(delay * (2 ** attempt))
-    raise last_exc
 
 # === Вспомогательные функции ===
 
@@ -51,7 +38,7 @@ def get_user_addresses(users: Dict, network: str) -> Dict[str, str]:
             result[addr.lower()] = uid
     return result
 
-async def get_web3_with_fallback(w3_primary, w3_fallback, network_name: str) -> Web3:
+def get_web3_with_fallback(w3_primary, w3_fallback, network_name: str) -> Optional[Web3]:
     """Возвращает рабочий Web3-экземпляр, переключаясь на fallback при необходимости."""
     if w3_primary.is_connected():
         return w3_primary
@@ -60,6 +47,35 @@ async def get_web3_with_fallback(w3_primary, w3_fallback, network_name: str) -> 
         logger.info(f"{network_name} переключён на fallback RPC")
         return w3_fallback
     logger.error(f"{network_name} fallback RPC тоже недоступен")
+    return None
+
+def get_block_with_retry(w3, block_num, full_tx=True, retries=3, delay=1):
+    """Синхронный вызов get_block с повторными попытками."""
+    for attempt in range(retries):
+        try:
+            return w3.eth.get_block(block_num, full_transactions=full_tx)
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            logger.warning(f"Блок {block_num} ошибка (попытка {attempt+1}): {e}")
+            time.sleep(delay * (2 ** attempt))
+    return None
+
+def get_logs_with_retry(w3, params, retries=3, delay=1):
+    """Синхронный вызов get_logs с повторными попытками."""
+    for attempt in range(retries):
+        try:
+            return w3.eth.get_logs(params)
+        except Exception as e:
+            # Если лимит превышен — делаем долгую паузу
+            if "limit exceeded" in str(e).lower():
+                logger.warning("RPC лимит превышен, пауза 60 секунд...")
+                time.sleep(60)
+                continue
+            if attempt == retries - 1:
+                raise
+            logger.warning(f"get_logs ошибка (попытка {attempt+1}): {e}")
+            time.sleep(delay * (2 ** attempt))
     return None
 
 # =============================================================================
@@ -71,9 +87,9 @@ async def monitor_evm() -> None:
     last_alert_time = 0
     while True:
         try:
-            w3 = await get_web3_with_fallback(w3_eth, w3_eth_fallback, "EVM")
+            w3 = get_web3_with_fallback(w3_eth, w3_eth_fallback, "EVM")
             if not w3:
-                if time.time() - last_alert_time > 300:  # не чаще 5 минут
+                if time.time() - last_alert_time > 300:
                     await notify_owner("🚨 <b>EVM основной и fallback RPC недоступны!</b>")
                     last_alert_time = time.time()
                 await asyncio.sleep(MONITOR_INTERVAL)
@@ -95,22 +111,19 @@ async def monitor_evm() -> None:
                 continue
 
             from_block = last_block + 1
-            # Проверяем только последние 2 блока за раз, чтобы не перегружать RPC
-            to_block = min(current_block, from_block + 2)
+            to_block = min(current_block, from_block + 2)  # только 2 блока за раз
 
             if from_block <= to_block:
                 addr_to_uid = get_user_addresses(users, "evm")
                 # Сканируем блоки для нативных ETH
                 for block_num in range(from_block, to_block + 1):
                     try:
-                        block = await call_with_retry(
-                            lambda: w3.eth.get_block(block_num, full_transactions=True),
-                            retries=2, delay=1
-                        )
+                        block = get_block_with_retry(w3, block_num, full_tx=True, retries=2, delay=1)
                     except Exception as e:
                         logger.warning("EVM блок %s: %s", block_num, e)
                         continue
-
+                    if not block:
+                        continue
                     for tx in block.transactions:
                         to_addr = (tx.get("to") or "").lower()
                         if to_addr in addr_to_uid:
@@ -121,7 +134,6 @@ async def monitor_evm() -> None:
                                     continue
                                 uid = addr_to_uid[to_addr]
                                 eth_val = w3.from_wei(value, "ether")
-                                # Автосбор
                                 collect_tx = await auto_collect_evm(uid, "ETH", eth_val, to_addr)
                                 storage.add_deposit(uid, "evm", "ETH", eth_val, tx_hash)
                                 storage.mark_tx_processed(tx_hash, "evm", "ETH")
@@ -159,23 +171,19 @@ async def _monitor_evm_tokens(w3: Web3, network: str, contract_addrs: List[str],
     """Мониторинг нескольких токенов за один запрос eth_getLogs."""
     if not contract_addrs or len(contract_addrs) == 0:
         return
-    # Убираем пустые адреса
     valid = [(addr, name, dec) for addr, name, dec in zip(contract_addrs, token_names, decimals) if addr and addr != "0x"]
     if not valid:
         return
     try:
-        # Формируем список checksum-адресов
         addresses = [Web3.to_checksum_address(addr) for addr, _, _ in valid]
-        logs = await call_with_retry(
-            lambda: w3.eth.get_logs({
-                "fromBlock": from_block,
-                "toBlock": to_block,
-                "address": addresses,
-                "topics": [ERC20_TRANSFER_TOPIC],
-            }),
-            retries=2, delay=1
-        )
-        # Создаём маппинг адрес контракта -> (имя, decimals)
+        logs = get_logs_with_retry(w3, {
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "address": addresses,
+            "topics": [ERC20_TRANSFER_TOPIC],
+        }, retries=2, delay=1)
+        if logs is None:
+            return
         addr_to_info = {addr.lower(): (name, dec) for addr, name, dec in valid}
         for log in logs:
             tx_hash = log["transactionHash"].hex()
@@ -201,7 +209,7 @@ async def _monitor_evm_tokens(w3: Web3, network: str, contract_addrs: List[str],
             uid = addr_to_uid[to_addr_lower]
             token_val = amount / (10 ** dec)
 
-            # Автосбор (запускаем асинхронно)
+            # Автосбор
             if network == "evm":
                 asyncio.create_task(auto_collect_evm(uid, token_name, token_val, to_addr))
             else:
@@ -230,7 +238,7 @@ async def monitor_bep20() -> None:
     last_alert_time = 0
     while True:
         try:
-            w3 = await get_web3_with_fallback(w3_bsc, w3_bsc_fallback, "BSC")
+            w3 = get_web3_with_fallback(w3_bsc, w3_bsc_fallback, "BSC")
             if not w3:
                 if time.time() - last_alert_time > 300:
                     await notify_owner("🚨 <b>BSC основной и fallback RPC недоступны!</b>")
@@ -260,14 +268,12 @@ async def monitor_bep20() -> None:
                 addr_to_uid = get_user_addresses(users, "bep20")
                 for block_num in range(from_block, to_block + 1):
                     try:
-                        block = await call_with_retry(
-                            lambda: w3.eth.get_block(block_num, full_transactions=True),
-                            retries=2, delay=1
-                        )
+                        block = get_block_with_retry(w3, block_num, full_tx=True, retries=2, delay=1)
                     except Exception as e:
                         logger.warning("BSC блок %s: %s", block_num, e)
                         continue
-
+                    if not block:
+                        continue
                     for tx in block.transactions:
                         to_addr = (tx.get("to") or "").lower()
                         if to_addr in addr_to_uid:
@@ -326,16 +332,11 @@ async def monitor_trc20() -> None:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Получаем все адреса пользователей в TRC20
             addr_to_uid = get_user_addresses(users, "trc20")
             if not addr_to_uid:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Мониторим нативные TRX (только для всех пользователей за один раз?)
-            # Используем API для получения транзакций по адресам — но TronGrid не позволяет указать несколько адресов.
-            # Поэтому делаем по одному запросу на пользователя, но с пагинацией только для новых транзакций.
-            # Чтобы снизить нагрузку, проверяем только последние 10 транзакций на пользователя.
             for address, uid in addr_to_uid.items():
                 await _monitor_tron_native_optimized(address, uid, users[uid].get("username", ""), tron_url)
                 await _monitor_tron_token_optimized(address, uid, users[uid].get("username", ""),
