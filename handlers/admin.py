@@ -9,18 +9,21 @@ from aiogram.filters import Command
 
 from config import OWNER_ID, router
 from db import storage
-from keyboards import network_kb, token_kb
+from keyboards import network_kb, token_kb, main_menu, hide_menu
 from states import user_states
 
 
 @router.message(Command("setfee"))
 async def cmd_setfee(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        await message.answer("❌ Только для владельца.")
+        await message.answer("❌ Только для владельца.", reply_markup=main_menu(message.from_user.id))
         return
 
     user_states[str(OWNER_ID)] = {"step": "setfee_network", "data": {}}
-    await message.answer("⚙️ <b>Установка комиссии</b>\n\nВыберите сеть:", reply_markup=network_kb())
+    await message.answer("⚙️ <b>Установка комиссии</b>\n\nВыберите сеть:",
+                         reply_markup=network_kb())
+    # Скрываем Reply-клавиатуру
+    await message.answer("Выберите сеть:", reply_markup=hide_menu())
 
 
 @router.callback_query(F.data.startswith("net:"))
@@ -38,7 +41,8 @@ async def on_setfee_network(callback: types.CallbackQuery):
     user_states[user_id]["step"] = "setfee_token"
     user_states[user_id]["data"]["network"] = network
 
-    await callback.message.edit_text(f"⚙️ Комиссия\n🌐 Сеть: <b>{network.upper()}</b>\n\nВыберите токен:", reply_markup=token_kb(network))
+    await callback.message.edit_text(f"⚙️ Комиссия\n🌐 Сеть: <b>{network.upper()}</b>\n\nВыберите токен:",
+                                     reply_markup=token_kb(network))
     await callback.answer()
 
 
@@ -67,6 +71,7 @@ async def on_setfee_token(callback: types.CallbackQuery):
         f"Введите новую комиссию (число {token}):"
     )
     await callback.answer()
+    # Скрываем Reply-клавиатуру (она уже скрыта)
 
 
 @router.message(F.text.regexp(r"^\d+(\.\d+)?$"))
@@ -81,7 +86,7 @@ async def on_setfee_amount(message: types.Message):
     try:
         amount = float(message.text.strip())
     except ValueError:
-        await message.answer("❌ Введите число.")
+        await message.answer("❌ Введите число.", reply_markup=hide_menu())
         return
 
     data = user_states[user_id]["data"]
@@ -91,22 +96,24 @@ async def on_setfee_amount(message: types.Message):
     storage.set_fee(network, token, amount)
     del user_states[user_id]
 
-    await message.answer(f"✅ Комиссия установлена:\n🌐 {network.upper()} | {token}\n💰 {amount:.6f} {token}")
+    await message.answer(f"✅ Комиссия установлена:\n🌐 {network.upper()} | {token}\n💰 {amount:.6f} {token}",
+                         reply_markup=main_menu(message.from_user.id))
 
 
 @router.message(Command("fees"))
 async def cmd_fees(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        await message.answer("❌ Только для владельца.")
+        await message.answer("❌ Только для владельца.", reply_markup=main_menu(message.from_user.id))
         return
 
     fees = storage.get_all_fees()
     if not fees:
-        await message.answer("📋 Комиссии не установлены (все 0).")
+        await message.answer("📋 Комиссии не установлены (все 0).",
+                             reply_markup=main_menu(message.from_user.id))
         return
 
     text = "📋 <b>Комиссии:</b>\n\n"
     for f in fees:
         text += f"🌐 {f['network'].upper()} | {f['token']}: <b>{f['fee']:.6f}</b>\n"
 
-    await message.answer(text)
+    await message.answer(text, reply_markup=main_menu(message.from_user.id))
