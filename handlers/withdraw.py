@@ -11,7 +11,7 @@ from aiogram.filters import Command
 
 from config import logger, router
 from db import storage
-from keyboards import confirm_kb, network_kb, token_kb
+from keyboards import confirm_kb, network_kb, token_kb, main_menu, hide_menu
 from states import user_states
 from withdraw_service import withdraw_bep20, withdraw_evm
 
@@ -22,11 +22,18 @@ async def cmd_withdraw(message: types.Message):
     users = storage.get_users()
 
     if user_id not in users:
-        await message.answer("❌ Сначала создайте кошелёк: /create_wallet")
+        await message.answer("❌ Сначала создайте кошелёк через меню.",
+                             reply_markup=main_menu(message.from_user.id))
         return
 
     user_states[user_id] = {"step": "select_network", "data": {}}
-    await message.answer("💸 <b>Вывод средств</b>\n\nВыберите сеть:", reply_markup=network_kb())
+    await message.answer("💸 <b>Вывод средств</b>\n\nВыберите сеть:",
+                         reply_markup=network_kb())
+    # Скрываем Reply-клавиатуру, так как пользователь будет работать с inline-кнопками
+    # Можно также отправить hide_menu(), но она будет перекрыта inline-клавиатурой.
+    # Оставим как есть, но если хотите, можно отправить hide_menu() отдельно:
+    # await message.answer("Для отмены нажмите кнопку 'Отмена' внутри диалога.",
+    #                      reply_markup=hide_menu())
 
 
 @router.callback_query(F.data.startswith("net:"))
@@ -40,7 +47,8 @@ async def on_network_selected(callback: types.CallbackQuery):
 
     user_states[user_id]["step"] = "select_token"
     user_states[user_id]["data"]["network"] = network
-    await callback.message.edit_text(f"💸 Вывод\n🌐 Сеть: <b>{network.upper()}</b>\n\nВыберите токен:", reply_markup=token_kb(network))
+    await callback.message.edit_text(f"💸 Вывод\n🌐 Сеть: <b>{network.upper()}</b>\n\nВыберите токен:",
+                                     reply_markup=token_kb(network))
     await callback.answer()
 
 
@@ -54,7 +62,6 @@ async def on_token_selected(callback: types.CallbackQuery):
         await callback.answer("Сессия устарела. Начните заново: /withdraw")
         return
 
-    # Проверка баланса
     balance = storage.get_balance(user_id, network, token)
     if balance <= 0:
         await callback.answer("❌ Баланс пуст!")
@@ -81,6 +88,8 @@ async def on_token_selected(callback: types.CallbackQuery):
         f"✅ Доступно: <b>{available:.6f}</b> {token}\n\n"
         f"Введите сумму для вывода (макс {available:.6f}):"
     )
+    # Также можно отправить hide_menu(), чтобы скрыть Reply-клавиатуру
+    await callback.message.answer("Введите сумму числом:", reply_markup=hide_menu())
     await callback.answer()
 
 
@@ -94,7 +103,7 @@ async def on_amount_entered(message: types.Message):
     try:
         amount = float(message.text.strip())
     except ValueError:
-        await message.answer("❌ Введите число.")
+        await message.answer("❌ Введите число.", reply_markup=hide_menu())
         return
 
     data = user_states[user_id]["data"]
@@ -104,7 +113,8 @@ async def on_amount_entered(message: types.Message):
     fee = data["fee"]
 
     if amount <= 0 or amount > available:
-        await message.answer(f"❌ Некорректная сумма. Доступно: {available:.6f} {token}")
+        await message.answer(f"❌ Некорректная сумма. Доступно: {available:.6f} {token}",
+                             reply_markup=hide_menu())
         return
 
     user_states[user_id]["step"] = "enter_address"
@@ -117,7 +127,8 @@ async def on_amount_entered(message: types.Message):
         f"💰 Сумма: <b>{amount:.6f}</b> {token}\n"
         f"📋 Комиссия: <b>{fee:.6f}</b> {token}\n"
         f"📤 К получению: <b>{amount:.6f}</b> {token}\n\n"
-        f"Введите адрес для вывода:"
+        f"Введите адрес для вывода:",
+        reply_markup=hide_menu()
     )
 
 
@@ -134,12 +145,11 @@ async def handle_enter_address(message: types.Message):
     amount = data["amount"]
     fee = data["fee"]
 
-    # Валидация адреса
     if network == "trc20" and not address.startswith("T"):
-        await message.answer("❌ TRON адрес должен начинаться с T")
+        await message.answer("❌ TRON адрес должен начинаться с T", reply_markup=hide_menu())
         return
     elif network != "trc20" and not address.startswith("0x"):
-        await message.answer("❌ EVM адрес должен начинаться с 0x")
+        await message.answer("❌ EVM адрес должен начинаться с 0x", reply_markup=hide_menu())
         return
 
     user_states[user_id]["step"] = "confirm"
@@ -156,6 +166,8 @@ async def handle_enter_address(message: types.Message):
         f"❗ Проверьте адрес! Операция необратима.",
         reply_markup=confirm_kb("withdraw", confirm_data)
     )
+    # Скрываем Reply-клавиатуру (она не нужна, т.к. есть inline-кнопки)
+    await message.answer("Подтвердите или отмените операцию.", reply_markup=hide_menu())
 
 
 @router.callback_query(F.data.startswith("confirm:withdraw:"))
@@ -173,7 +185,6 @@ async def on_withdraw_confirmed(callback: types.CallbackQuery):
     address = data["address"]
     fee = data["fee"]
 
-    # Выполняем вывод
     if network == "bep20":
         success, result = await withdraw_bep20(address, token, amount)
     elif network == "evm":
@@ -197,6 +208,8 @@ async def on_withdraw_confirmed(callback: types.CallbackQuery):
 
     del user_states[user_id]
     await callback.answer()
+    # Возвращаем главное меню
+    await callback.message.answer("Главное меню:", reply_markup=main_menu(int(user_id)))
 
 
 @router.callback_query(F.data == "cancel")
@@ -206,6 +219,8 @@ async def on_cancel(callback: types.CallbackQuery):
         del user_states[user_id]
     await callback.message.edit_text("❌ Операция отменена.")
     await callback.answer()
+    # Возвращаем главное меню
+    await callback.message.answer("Главное меню:", reply_markup=main_menu(int(user_id)))
 
 
 @router.callback_query(F.data == "back:net")
@@ -214,5 +229,6 @@ async def on_back_network(callback: types.CallbackQuery):
     if user_id in user_states:
         user_states[user_id]["step"] = "select_network"
         user_states[user_id]["data"] = {}
-    await callback.message.edit_text("💸 <b>Вывод средств</b>\n\nВыберите сеть:", reply_markup=network_kb())
+    await callback.message.edit_text("💸 <b>Вывод средств</b>\n\nВыберите сеть:",
+                                     reply_markup=network_kb())
     await callback.answer()
