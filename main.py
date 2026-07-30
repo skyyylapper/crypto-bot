@@ -20,6 +20,9 @@ from monitors import monitor_bep20, monitor_evm, monitor_trc20
 
 # Импорт пакета handlers регистрирует все @router-хендлеры (see handlers/__init__.py)
 import handlers  # noqa: F401
+# Импортируем text_router отдельно после полной загрузки остальных хендлеров,
+# чтобы избежать циклической зависимости.
+import handlers.text_router  # noqa: F401
 
 
 async def main():
