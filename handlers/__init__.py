@@ -1,4 +1,5 @@
 # Пакет хендлеров бота.
 # Импортируется в main.py, чтобы зарегистрировать все @router-обработчики.
 
-from . import wallet, withdraw, admin, text_router  # noqa: F401
+from . import wallet, withdraw, admin  # noqa: F401
+# text_router импортируется отдельно в main.py, чтобы избежать циклической зависимости
